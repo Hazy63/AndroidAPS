@@ -88,6 +88,58 @@ jobs:
           path: out/*.apk
           retention-days: 90
 
+      - name: Upload APK to Google Drive
+        run: |
+          set -e
+          echo "Getting Google OAuth2 access token..."
+          TOKEN_RESPONSE=$(curl -s -X POST https://oauth2.googleapis.com/token \
+            -d client_id="${{ secrets.GDRIVE_CLIENT_ID }}" \
+            -d client_secret="${{ secrets.GDRIVE_CLIENT_SECRET }}" \
+            -d refresh_token="${{ secrets.GDRIVE_REFRESH_TOKEN }}" \
+            -d grant_type=refresh_token)
+          ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r .access_token)
+          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+            echo "Failed to get access token."
+            echo "$TOKEN_RESPONSE"
+            exit 1
+          fi
+
+          FILE=$(ls out/*.apk)
+          NAME=$(basename "$FILE")
+          FOLDER_ID="118LH5V5QTB4WlwplbnAsom6vZuhTvhni"
+
+          echo "Checking if $NAME already exists in Drive folder..."
+          QUERY="name='${NAME}' and '${FOLDER_ID}' in parents and trashed=false"
+          ENCODED_QUERY=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$QUERY")
+          FILE_ID=$(curl -s \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            "https://www.googleapis.com/drive/v3/files?q=${ENCODED_QUERY}&fields=files(id)" \
+            | jq -r '.files[0].id')
+
+          if [[ -n "$FILE_ID" && "$FILE_ID" != "null" ]]; then
+            echo "Deleting existing file with ID: $FILE_ID"
+            curl -s -X DELETE \
+              -H "Authorization: Bearer $ACCESS_TOKEN" \
+              "https://www.googleapis.com/drive/v3/files/${FILE_ID}"
+          fi
+
+          echo "Uploading $NAME to Google Drive..."
+          RESPONSE=$(curl -s -w "%{http_code}" -o /tmp/gdrive_response.json \
+            -X POST \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -F "metadata={\"name\":\"$NAME\", \"parents\":[\"$FOLDER_ID\"]};type=application/json;charset=UTF-8" \
+            -F "file=@$FILE;type=application/vnd.android.package-archive" \
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart")
+
+          HTTP_CODE="${RESPONSE: -3}"
+          if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "201" ]]; then
+            echo "Upload failed with HTTP status: $HTTP_CODE"
+            cat /tmp/gdrive_response.json
+            exit 1
+          fi
+
+          echo "Uploaded: $NAME to Drive folder $FOLDER_ID"
+
       - name: Create GitHub Release (only on tag push)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
