@@ -1,0 +1,63 @@
+name: Auto Sync Upstream
+
+# Holt neue Änderungen von nightscout/AndroidAPS (Original-Projekt) automatisch
+# in diesen Fork und pusht sie auf master. Der Push löst danach automatisch
+# den Workflow "Dennis Signed Release" aus, der eine neue signierte APK baut.
+#
+# Läuft täglich von selbst, kein manuelles Zutun nötig. Bei Merge-Konflikten
+# (selten, nur wenn eigene Dateien mit Upstream kollidieren) schlägt der Lauf
+# fehl und muss manuell aufgelöst werden.
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # täglich 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  sync:
+    name: Sync mit nightscout/AndroidAPS
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_FOR_SYNC }}
+
+      - name: Configure git
+        run: |
+          git config user.name "AAPS Dad Sync Bot"
+          git config user.email "actions@github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/nightscout/AndroidAPS.git
+
+      - name: Fetch upstream
+        run: git fetch upstream master
+
+      - name: Check for new commits
+        id: check
+        run: |
+          LOCAL=$(git rev-parse HEAD)
+          REMOTE=$(git rev-parse upstream/master)
+          if [ "$LOCAL" = "$REMOTE" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream changes
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          git merge upstream/master --no-edit
+          git push origin master
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.check.outputs.changed }}" = "true" ]; then
+            echo "Neue Upstream-Änderungen gemerged und gepusht. Build-Workflow wird automatisch ausgelöst."
+          else
+            echo "Keine neuen Upstream-Änderungen. Nichts zu tun."
+          fi

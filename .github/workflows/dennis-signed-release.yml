@@ -7,10 +7,14 @@ name: Dennis Signed Release
 # Auslösen:
 #  - manuell im Actions-Tab ("Run workflow")
 #  - automatisch bei jedem Push eines Tags im Format v* (z.B. v3.4.0.0)
+#  - automatisch nach jedem Merge von Upstream-Änderungen auf master
+#    (ausgelöst durch den "Auto Sync Upstream" Workflow)
 
 on:
   workflow_dispatch:
   push:
+    branches:
+      - master
     tags:
       - 'v*'
 
