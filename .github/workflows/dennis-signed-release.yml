@@ -1,0 +1,96 @@
+name: Dennis Signed Release
+
+# Baut die AAPS "full" App signiert mit unserem eigenen Keystore.
+# Dadurch bleibt der Signatur-Fingerabdruck über alle Versionen gleich,
+# und Android erlaubt ein normales Update statt Deinstallation + Neuinstallation.
+#
+# Auslösen:
+#  - manuell im Actions-Tab ("Run workflow")
+#  - automatisch bei jedem Push eines Tags im Format v* (z.B. v3.4.0.0)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build & Sign APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check required secrets
+        run: |
+          MISSING=0
+          for name in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "Missing secret: $name"
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" -eq 1 ]; then
+            exit 1
+          fi
+          echo "All required secrets present."
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Checkout source code
+        uses: actions/checkout@v5
+
+      - name: Decode keystore file
+        run: |
+          mkdir -p "$RUNNER_TEMP/keystore"
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/keystore/keystore.jks"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Extract VERSION
+        run: |
+          VERSION=$(grep 'val appVersion' buildSrc/src/main/kotlin/Versions.kt | awk -F '"' '{print $2}')
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK (full flavor)
+        run: |
+          ./gradlew :app:assembleFullRelease \
+            -Dorg.gradle.jvmargs="-Xmx8g -XX:+UseParallelGC -Xss1024m" \
+            -Dorg.gradle.daemon=false \
+            -Dorg.gradle.caching=true \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/keystore/keystore.jks" \
+            -Pandroid.injected.signing.store.password="${{ secrets.KEYSTORE_PASSWORD }}" \
+            -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
+            -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}"
+
+      - name: Rename APK with version
+        run: |
+          mkdir -p out
+          cp app/build/outputs/apk/full/release/*.apk "out/aaps-${VERSION}-signed.apk"
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aaps-signed-apk
+          path: out/*.apk
+          retention-days: 90
+
+      - name: Create GitHub Release (only on tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.apk
+          name: AAPS ${{ github.ref_name }} (signed)
+          body: |
+            Signierte AAPS APK, gebaut mit eigenem Keystore.
+            Installation über diese APK ersetzt eine vorherige Installation mit
+            dem gleichen Keystore als normales Update (Daten bleiben erhalten).
