@@ -76,7 +76,13 @@ jobs:
           S_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           S_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           S_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-          S_GDRIVE_OAUTH2: ${{ secrets.GDRIVE_OAUTH2 }}
+          # Drive-Zugang: die drei Secrets, die auch "Dennis Signed Release"
+          # nutzt. Vorher stand hier ein einzelnes GDRIVE_OAUTH2 (base64 aus
+          # "client_id|refresh_token"), das in diesem Repo nie existiert hat --
+          # darum brach der Lauf 41442908681 am 02.11.2026 nach 23s ab.
+          S_GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          S_GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          S_GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
         run: |
           # The heredoc form of GITHUB_ENV keeps any value intact, newlines
           # included. The delimiter is random so that no value can close the
@@ -104,7 +110,9 @@ jobs:
             emit KEY_ALIAS         "$S_KEY_ALIAS"
             emit KEY_PASSWORD      "$S_KEY_PASSWORD"
           fi
-          emit GDRIVE_OAUTH2 "$S_GDRIVE_OAUTH2"
+          emit GDRIVE_CLIENT_ID     "$S_GDRIVE_CLIENT_ID"
+          emit GDRIVE_CLIENT_SECRET "$S_GDRIVE_CLIENT_SECRET"
+          emit GDRIVE_REFRESH_TOKEN "$S_GDRIVE_REFRESH_TOKEN"
 
       - name: Check Secrets
         run: |
@@ -119,7 +127,9 @@ jobs:
           }
 
           # Check secrets
-          check_secret "$GDRIVE_OAUTH2" "GDRIVE_OAUTH2"
+          check_secret "$GDRIVE_CLIENT_ID" "GDRIVE_CLIENT_ID"
+          check_secret "$GDRIVE_CLIENT_SECRET" "GDRIVE_CLIENT_SECRET"
+          check_secret "$GDRIVE_REFRESH_TOKEN" "GDRIVE_REFRESH_TOKEN"
 
           check_secret "$KEYSTORE_BASE64" "KEYSTORE_BASE64"
           check_secret "$KEYSTORE_PASSWORD" "KEYSTORE_PASSWORD"
@@ -167,29 +177,15 @@ jobs:
           rm -f "$KEYTOOL_LOG"
           echo "✅ Keystore and credentials validated."
 
-      - name: Decode GDrive OAuth2 secrets
-        run: |
-          # GDRIVE_OAUTH2 is already in the environment from the decode step
-          # above, so nothing has to be pasted into the script text here either.
-          DELIM="AAPS_EOF_$(openssl rand -hex 16)"
-          emit_masked() {
-            echo "::add-mask::$2"
-            printf '%s<<%s\n%s\n%s\n' "$1" "$DELIM" "$2" "$DELIM" >> "$GITHUB_ENV"
-          }
-
-          echo "🔐 Decoding GDRIVE_OAUTH2..."
-          DECODED=$(printf '%s' "$GDRIVE_OAUTH2" | base64 -d)
-
-          emit_masked GDRIVE_CLIENT_ID     "$(printf '%s' "$DECODED" | cut -d'|' -f1)"
-          emit_masked GDRIVE_REFRESH_TOKEN "$(printf '%s' "$DECODED" | cut -d'|' -f2)"
-
-          echo "✅ GDRIVE_CLIENT_ID and GDRIVE_REFRESH_TOKEN extracted from GDRIVE_OAUTH2"
-
       - name: Retrieving Google Drive access token
         run: |
+          # client_secret muss mit: unser OAuth-Client ist vom Typ "Desktop app"
+          # und hat ein Secret, ohne das antwortet Google mit invalid_client.
+          # Genauso macht es "Dennis Signed Release".
           echo "🔐 Getting Google OAuth2 access token..."
           TOKEN_RESPONSE=$(curl -s -X POST https://oauth2.googleapis.com/token \
             -d client_id="$GDRIVE_CLIENT_ID" \
+            -d client_secret="$GDRIVE_CLIENT_SECRET" \
             -d refresh_token="$GDRIVE_REFRESH_TOKEN" \
             -d grant_type=refresh_token)
           ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r .access_token)
@@ -267,14 +263,42 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      # Gleiche Vorsorge wie in "Dennis Signed Release": der Runner hat nur
+      # 4 CPUs / 15 GiB, und seit Upstream 4.0.0 reicht das bei zu grossen
+      # Heaps nicht mehr -- der Job stirbt dann ohne Fehlermeldung mit
+      # "The runner has received a shutdown signal".
+      - name: Show runner resources
+        run: |
+          echo "CPUs: $(nproc)"
+          free -h
+          df -h / /mnt
+
+      - name: Add swap as safety net
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 8G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          sudo sysctl -w vm.swappiness=10
+          free -h
+
       - name: Build APKs
         run: |
+              # Kotlin laeuft hier bewusst "in-process", also im Gradle-Heap
+              # statt in einem eigenen Daemon -- ein grosser Prozess statt
+              # zwei, das ist auf dem kleinen Runner die sparsamere Variante.
+              # Deshalb bleibt der Heap mit 7g groesser als im Release-Build:
+              # der Kotlin-Compiler wohnt mit drin. Das frueher hier gesetzte
+              # -Dkotlin.daemon.jvm.options war doppelt wirkungslos: mit
+              # in-process gibt es keinen Daemon, und -D erreicht die
+              # Kotlin-Einstellungen ohnehin nicht (die wollen -P).
               ./gradlew :app:assemble${{ env.BUILD_VARIANT }} :wear:assemble${{ env.BUILD_VARIANT }} \
-              -Dorg.gradle.jvmargs="-Xmx8g -XX:+UseParallelGC -Xss4m" \
-              -Dkotlin.daemon.jvm.options="-Xmx2g" \
+              --max-workers=4 \
+              -Dorg.gradle.jvmargs="-Xmx7g -XX:MaxMetaspaceSize=1g -XX:+UseParallelGC -Xss4m" \
               -Dkotlin.compiler.execution.strategy="in-process" \
               -Dorg.gradle.daemon=true \
-              -Dorg.gradle.workers.max=8 \
               -Dorg.gradle.caching=true \
               -Pandroid.injected.signing.store.file="$RUNNER_TEMP/keystore/keystore.jks" \
               -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
@@ -291,22 +315,13 @@ jobs:
           set -e
           echo "🔐 Start uploading APKs to Google Drive..."
 
-          echo "📁 Checking or creating AAPS folder"
-          AAPS_FOLDER_ID=$(curl -s -X GET \
-            -H "Authorization: Bearer $ACCESS_TOKEN" \
-            "https://www.googleapis.com/drive/v3/files?q=name='AAPS'+and+mimeType='application/vnd.google-apps.folder'+and+trashed=false" \
-            | jq -r '.files[0].id')
-
-          if [ "$AAPS_FOLDER_ID" == "null" ] || [ -z "$AAPS_FOLDER_ID" ]; then
-            AAPS_FOLDER_ID=$(curl -s -X POST \
-              -H "Authorization: Bearer $ACCESS_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d '{"name": "AAPS", "mimeType": "application/vnd.google-apps.folder"}' \
-              "https://www.googleapis.com/drive/v3/files" | jq -r '.id')
-            echo "📂 Created AAPS folder: $AAPS_FOLDER_ID"
-          else
-            echo "📂 Found AAPS folder: $AAPS_FOLDER_ID"
-          fi
+          # Feste Ordner-ID statt Suche nach dem Namen "AAPS": der OAuth-Scope
+          # ist drive.file, damit sieht die App nur, was sie selbst angelegt
+          # hat. Die Namenssuche haette den echten Ordner von Dennis nie
+          # gefunden und daneben einen zweiten, leeren "AAPS" erzeugt.
+          # Gleiche ID wie in "Dennis Signed Release" = G:\Meine Ablage\AAPS.
+          AAPS_FOLDER_ID="118LH5V5QTB4WlwplbnAsom6vZuhTvhni"
+          echo "📂 Using AAPS folder: $AAPS_FOLDER_ID"
 
           echo "📁 Checking or creating version folder: $VERSION"
           VERSION_FOLDER_ID=$(curl -s -X GET \
