@@ -60,6 +60,29 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      # Der Build starb am 01.11.2026 mit "The runner has received a shutdown
+      # signal" - kein Code-Fehler, sondern der Runner ging am Arbeitsspeicher
+      # aus. Upstream 4.0.0 hat den Kotlin-Daemon von 2g auf 4g gehoben; mit
+      # 8g Gradle-Heap dazu sprengt das die 16 GB des Standard-Runners.
+      # Deshalb: Ressourcen protokollieren, Swap als Netz, und beim Build
+      # unten Heaps, die rechnerisch in den Runner passen.
+      - name: Show runner resources
+        run: |
+          echo "CPUs: $(nproc)"
+          free -h
+          df -h / /mnt
+
+      - name: Add swap as safety net
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 8G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          sudo sysctl -w vm.swappiness=10
+          free -h
+
       - name: Extract VERSION
         run: |
           VERSION=$(grep 'val appVersion' buildSrc/src/main/kotlin/Versions.kt | awk -F '"' '{print $2}')
@@ -68,7 +91,9 @@ jobs:
       - name: Build signed release APK (full flavor)
         run: |
           ./gradlew :app:assembleFullRelease \
-            -Dorg.gradle.jvmargs="-Xmx8g -XX:+UseParallelGC -Xss1024m" \
+            --max-workers=4 \
+            -Dorg.gradle.jvmargs="-Xmx5g -XX:MaxMetaspaceSize=1g -XX:+UseParallelGC -Xss4m" \
+            -Pkotlin.daemon.jvm.options="-Xmx3g" \
             -Dorg.gradle.daemon=false \
             -Dorg.gradle.caching=true \
             -Pandroid.injected.signing.store.file="$RUNNER_TEMP/keystore/keystore.jks" \
